@@ -30,6 +30,10 @@ def _canonicalize_url(url: str) -> str:
     return urlunsplit((parts.scheme, parts.netloc, parts.path, canonical_query, ""))
 
 
+def canonicalize_url(url: str) -> str:
+    return _canonicalize_url(url)
+
+
 def _to_iso8601(entry: dict) -> str | None:
     if getattr(entry, "published_parsed", None):
         published_dt = datetime(*entry.published_parsed[:6], tzinfo=UTC)
