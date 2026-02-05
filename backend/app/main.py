@@ -2,7 +2,7 @@ from datetime import UTC, datetime
 import os
 from typing import List
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -43,6 +43,31 @@ class Article(BaseModel):
 
 class FeedResponse(BaseModel):
     items: List[Article]
+    next_cursor: str | None
+
+
+class ArticleDetailSource(BaseModel):
+    name: str
+    url: str
+
+
+class ArticleDetail(BaseModel):
+    id: str
+    title: str
+    summary: str
+    category: str
+    published_at: str
+    original_url: str
+    source: ArticleDetailSource
+
+
+class CategoryItem(BaseModel):
+    id: str
+    label: str
+
+
+class CategoriesResponse(BaseModel):
+    items: List[CategoryItem]
 
 SOURCES = [
     {
@@ -85,6 +110,17 @@ def _datetime_to_iso8601(value: datetime) -> str:
     return utc_value.isoformat().replace("+00:00", "Z")
 
 
+def _parse_cursor(cursor: str) -> datetime:
+    try:
+        parsed = _parse_iso8601(cursor)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid cursor format")
+
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
 def _article_to_response_item(article: DBArticle) -> dict:
     return {
         "id": article.id,
@@ -98,6 +134,21 @@ def _article_to_response_item(article: DBArticle) -> dict:
             "url": article.source.url,
         },
         "original_url": article.canonical_url,
+    }
+
+
+def _article_to_detail_response_item(article: DBArticle) -> dict:
+    return {
+        "id": article.id,
+        "title": article.title,
+        "summary": article.summary.summary_text,
+        "category": article.category,
+        "published_at": _datetime_to_iso8601(article.published_at),
+        "original_url": article.canonical_url,
+        "source": {
+            "name": article.source.name,
+            "url": article.source.url,
+        },
     }
 
 
@@ -267,42 +318,73 @@ def health_check():
 
 
 @app.get("/v1/feed", response_model=FeedResponse)
-def get_feed():
+def get_feed(
+    limit: int = Query(default=20, ge=1, le=50),
+    cursor: str | None = Query(default=None),
+):
     db = SessionLocal()
     try:
-        articles = db.execute(
+        query = (
             select(DBArticle)
             .join(DBSummary, DBSummary.article_id == DBArticle.id)
             .options(joinedload(DBArticle.source), joinedload(DBArticle.summary))
             .order_by(DBArticle.published_at.desc())
-        ).scalars().all()
-        items = [_article_to_response_item(article) for article in articles]
-        return {"items": items}
+            .limit(limit + 1)
+        )
+        if cursor is not None:
+            cursor_dt = _parse_cursor(cursor).replace(tzinfo=None)
+            query = query.where(DBArticle.published_at < cursor_dt)
+
+        articles = db.execute(query).scalars().all()
+        page_articles = articles[:limit]
+        items = [_article_to_response_item(article) for article in page_articles]
+
+        next_cursor = None
+        if len(articles) > limit and page_articles:
+            next_cursor = _datetime_to_iso8601(page_articles[-1].published_at)
+
+        return {"items": items, "next_cursor": next_cursor}
     finally:
         db.close()
 
 
 @app.get("/v1/feed/{category}", response_model=FeedResponse)
-def get_feed_by_category(category: str):
+def get_feed_by_category(
+    category: str,
+    limit: int = Query(default=20, ge=1, le=50),
+    cursor: str | None = Query(default=None),
+):
     if category not in VALID_CATEGORIES:
         raise HTTPException(status_code=404, detail="Category not found")
 
     db = SessionLocal()
     try:
-        articles = db.execute(
+        query = (
             select(DBArticle)
             .join(DBSummary, DBSummary.article_id == DBArticle.id)
             .options(joinedload(DBArticle.source), joinedload(DBArticle.summary))
             .where(DBArticle.category == category)
             .order_by(DBArticle.published_at.desc())
-        ).scalars().all()
-        items = [_article_to_response_item(article) for article in articles]
-        return {"items": items}
+            .limit(limit + 1)
+        )
+        if cursor is not None:
+            cursor_dt = _parse_cursor(cursor).replace(tzinfo=None)
+            query = query.where(DBArticle.published_at < cursor_dt)
+
+        articles = db.execute(query).scalars().all()
+        page_articles = articles[:limit]
+        items = [_article_to_response_item(article) for article in page_articles]
+
+        next_cursor = None
+        if len(articles) > limit and page_articles:
+            next_cursor = _datetime_to_iso8601(page_articles[-1].published_at)
+
+        return {"items": items, "next_cursor": next_cursor}
     finally:
         db.close()
 
 
-@app.get("/v1/articles/{id}", response_model=Article)
+@app.get("/v1/articles/{id}", response_model=ArticleDetail)
 def get_article_by_id(id: str):
     db = SessionLocal()
     try:
@@ -313,8 +395,27 @@ def get_article_by_id(id: str):
             .where(DBArticle.id == id)
         ).scalar_one_or_none()
         if article is not None:
-            return _article_to_response_item(article)
+            return _article_to_detail_response_item(article)
     finally:
         db.close()
 
     raise HTTPException(status_code=404, detail="Article not found")
+
+
+@app.get("/v1/categories", response_model=CategoriesResponse)
+def get_categories():
+    db = SessionLocal()
+    try:
+        categories = db.execute(
+            select(DBArticle.category)
+            .join(DBSummary, DBSummary.article_id == DBArticle.id)
+            .where(DBArticle.category.is_not(None))
+            .where(DBArticle.category != "")
+            .distinct()
+            .order_by(DBArticle.category.asc())
+        ).scalars().all()
+
+        items = [{"id": category, "label": category.title()} for category in categories]
+        return {"items": items}
+    finally:
+        db.close()
