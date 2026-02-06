@@ -13,6 +13,7 @@ from app.db.models import Source as DBSource
 from app.db.models import Summary as DBSummary
 from app.db.session import SessionLocal
 from app.ingestion.rss import canonicalize_url, parse_rss_feed
+from app.sources import SOURCES
 
 app = FastAPI(
     title="Ground Truth API",
@@ -20,7 +21,14 @@ app = FastAPI(
     version="0.1.0"
 )
 
-VALID_CATEGORIES = {"models", "hardware", "research", "policy", "industry", "tools"}
+VALID_CATEGORIES = {
+    "models",
+    "research",
+    "products",
+    "open_source",
+    "hardware",
+    "regulation",
+}
 SUMMARY_MODEL = "gpt-4.1-mini"
 SUMMARY_VERSION = 1
 
@@ -69,32 +77,15 @@ class CategoryItem(BaseModel):
 class CategoriesResponse(BaseModel):
     items: List[CategoryItem]
 
-SOURCES = [
-    {
-        "id": "src_openai",
-        "name": "OpenAI",
-        "url": "https://openai.com",
-        "rss_url": "https://openai.com/news/rss.xml",
-        "category": "models",
-        "active": True,
-    },
-    {
-        "id": "src_google_ai",
-        "name": "Google AI Blog",
-        "url": "https://blog.google/technology/ai/",
-        "rss_url": "https://blog.google/technology/ai/rss/",
-        "category": "research",
-        "active": True,
-    },
-    {
-        "id": "src_meta_ai",
-        "name": "Meta AI",
-        "url": "https://ai.meta.com/blog/",
-        "rss_url": "https://ai.meta.com/blog/rss/",
-        "category": "industry",
-        "active": True,
-    },
-]
+
+class SourceItem(BaseModel):
+    id: str
+    name: str
+    url: str
+
+
+class SourcesResponse(BaseModel):
+    items: List[SourceItem]
 
 
 def _parse_iso8601(value: str) -> datetime:
@@ -321,9 +312,29 @@ def health_check():
 def get_feed(
     limit: int = Query(default=20, ge=1, le=50),
     cursor: str | None = Query(default=None),
+    sources: str | None = Query(default=None),
 ):
     db = SessionLocal()
     try:
+        # Discover feed: when sources is omitted, behavior matches current feed.
+        # For You feed: when sources is provided, filter by requested active sources.
+        source_ids = None
+        if sources:
+            requested_ids = {value.strip() for value in sources.split(",") if value.strip()}
+            if requested_ids:
+                source_ids = set(
+                    db.execute(
+                        select(DBSource.id)
+                        .where(DBSource.active.is_(True))
+                        .where(DBSource.id.in_(requested_ids))
+                    ).scalars().all()
+                )
+            else:
+                source_ids = set()
+
+        if source_ids is not None and len(source_ids) == 0:
+            return {"items": [], "next_cursor": None}
+
         query = (
             select(DBArticle)
             .join(DBSummary, DBSummary.article_id == DBArticle.id)
@@ -331,6 +342,8 @@ def get_feed(
             .order_by(DBArticle.published_at.desc())
             .limit(limit + 1)
         )
+        if source_ids is not None:
+            query = query.where(DBArticle.source_id.in_(source_ids))
         if cursor is not None:
             cursor_dt = _parse_cursor(cursor).replace(tzinfo=None)
             query = query.where(DBArticle.published_at < cursor_dt)
@@ -353,20 +366,42 @@ def get_feed_by_category(
     category: str,
     limit: int = Query(default=20, ge=1, le=50),
     cursor: str | None = Query(default=None),
+    sources: str | None = Query(default=None),
 ):
     if category not in VALID_CATEGORIES:
         raise HTTPException(status_code=404, detail="Category not found")
 
     db = SessionLocal()
     try:
+        # Discover feed: when sources is omitted, behavior matches current feed.
+        # For You feed: when sources is provided, filter by requested active sources.
+        source_ids = None
+        if sources:
+            requested_ids = {value.strip() for value in sources.split(",") if value.strip()}
+            if requested_ids:
+                source_ids = set(
+                    db.execute(
+                        select(DBSource.id)
+                        .where(DBSource.active.is_(True))
+                        .where(DBSource.id.in_(requested_ids))
+                    ).scalars().all()
+                )
+            else:
+                source_ids = set()
+
+        if source_ids is not None and len(source_ids) == 0:
+            return {"items": [], "next_cursor": None}
+
         query = (
             select(DBArticle)
             .join(DBSummary, DBSummary.article_id == DBArticle.id)
             .options(joinedload(DBArticle.source), joinedload(DBArticle.summary))
-            .where(DBArticle.category == category)
+            .where(DBArticle.primary_category == category)
             .order_by(DBArticle.published_at.desc())
             .limit(limit + 1)
         )
+        if source_ids is not None:
+            query = query.where(DBArticle.source_id.in_(source_ids))
         if cursor is not None:
             cursor_dt = _parse_cursor(cursor).replace(tzinfo=None)
             query = query.where(DBArticle.published_at < cursor_dt)
@@ -407,15 +442,35 @@ def get_categories():
     db = SessionLocal()
     try:
         categories = db.execute(
-            select(DBArticle.category)
+            select(DBArticle.primary_category)
             .join(DBSummary, DBSummary.article_id == DBArticle.id)
-            .where(DBArticle.category.is_not(None))
-            .where(DBArticle.category != "")
+            .where(DBArticle.primary_category.is_not(None))
+            .where(DBArticle.primary_category != "")
+            .where(DBArticle.primary_category != "uncategorized")
             .distinct()
-            .order_by(DBArticle.category.asc())
+            .order_by(DBArticle.primary_category.asc())
         ).scalars().all()
 
-        items = [{"id": category, "label": category.title()} for category in categories]
+        items = [
+            {"id": category, "label": category.replace("_", " ").title()}
+            for category in categories
+        ]
+        return {"items": items}
+    finally:
+        db.close()
+
+
+@app.get("/v1/sources", response_model=SourcesResponse)
+def get_sources():
+    db = SessionLocal()
+    try:
+        sources = db.execute(
+            select(DBSource)
+            .where(DBSource.active.is_(True))
+            .order_by(DBSource.name.asc())
+        ).scalars().all()
+
+        items = [{"id": source.id, "name": source.name, "url": source.url} for source in sources]
         return {"items": items}
     finally:
         db.close()

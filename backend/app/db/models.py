@@ -30,6 +30,7 @@ class Article(Base):
     source_id: Mapped[str] = mapped_column(String, ForeignKey("sources.id"), nullable=False)
     title: Mapped[str] = mapped_column(String, nullable=False)
     category: Mapped[str] = mapped_column(String, nullable=False)
+    primary_category: Mapped[str | None] = mapped_column(String, nullable=True)
     published_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     ingested_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=func.now())
 
